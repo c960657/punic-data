@@ -1367,6 +1367,8 @@ class PhpWriter
                 $result .= "\n".str_repeat($space, $indent);
             }
             $result .= ')';
+        } elseif ($data instanceof PhpFunction) {
+            $result = $data->toPhpSource();
         } elseif (is_string($data)) {
             $result = "'".addcslashes($data, "'\\")."'";
         } else {
@@ -1374,6 +1376,30 @@ class PhpWriter
         }
 
         return $result;
+    }
+}
+
+class PhpFunction
+{
+    /**
+     * @var array
+     */
+    protected $args;
+
+    /**
+     * @var string
+     */
+    protected $body;
+
+    public function __construct($args, $body)
+    {
+        $this->args = $args;
+        $this->body = $body;
+    }
+
+    public function toPhpSource()
+    {
+        return 'function ('.implode(', ', $this->args).') { '.$this->body.' }';
     }
 }
 
@@ -1481,6 +1507,7 @@ class CldrConverter
             new MetaZonesSupplementalPunicConversion(),
             new NoopSupplementalPunicConversion(array('supplemental', 'primaryZones')),
             new PluralsSupplementalPunicConversion(),
+            new Plurals2SupplementalPunicConversion(),
             new MeasurementDataSupplementalPunicConversion(),
             new CurrencyDataSupplementalPunicConversion(),
         );
@@ -3154,6 +3181,117 @@ class PluralsSupplementalPunicConversion extends SupplementalPunicConversion
         $dt = $this->realProcess($data);
 
         return $dt[1];
+    }
+}
+
+
+class Plurals2SupplementalPunicConversion extends SupplementalPunicConversion
+{
+    public function __construct()
+    {
+        parent::__construct('supplemental', array('supplemental', 'plurals-type-cardinal'), 'plurals2');
+    }
+
+    /**
+     * @param SourceData $sourceData
+     *
+     * @return string
+     */
+    protected function getSourceFile(SourceData $sourceData)
+    {
+        return $sourceData->getJsonDirectoryForGeneric('supplemental').'/plurals.json';
+    }
+
+    /**
+     * @param array $data
+     *
+     * @return array
+     */
+    protected function process(array $data)
+    {
+        $args = array('$n', '$i', '$v', '$w', '$f', '$t');
+
+        $data = parent::process($data);
+        foreach ($data as $l => $lData) {
+            $data[$l] = array();
+
+            $keys = array_keys($lData);
+            foreach ($keys as $key) {
+                if (!preg_match('/^pluralRule-count-(.+)$/', $key, $m)) {
+                    throw new Exception("Invalid node '$key'");
+                }
+
+                $rule = $m[1];
+                $v = ' ' . strtok($lData[$key], '@');
+
+                if ($rule === 'other') {
+                    if (strlen(trim($v)) > 0) {
+                        throw new Exception("Invalid node '$key': $vOriginal");
+                    }
+                } else {
+                    #$v = str_replace(array(' = '), ' == ', $v);
+                    $v = strtr($v, array(
+                        ' =' => ' ==',
+                        ' and' => ' &&',
+                        ' or' => ' ||',
+                        ' n' => ' $n',
+                        ' i' => ' $i',
+                        ' v' => ' $v',
+                        ' w' => ' $w',
+                        ' f' => ' $f',
+                        ' t' => ' $t',
+                    ));
+
+                    $i = 0;
+                    $v = preg_replace_callback(
+                        '/(\$[nivwft](?: % \\d+)?) (==|!=) ([\d.,-]+)/',
+                        function ($matches) use (&$i) {
+                            $expression = $matches[1];
+                            $operator = $matches[2];
+                            $ranges = $matches[3];
+
+                            if (strpos($expression, ' ') === false || is_numeric($ranges)) {
+                                $operand = $expression;
+                            } else {
+                                $operand = '$x'.$i++;
+                                $expression = '('.$operand.' = '.$expression.')';
+                            }
+
+                            $ranges = array_map(function ($range) use ($operand) {
+                                $endpoints = explode('..', $range);
+
+                                if (count($endpoints) == 1) {
+                                    return $operand.' == '.$range;
+                                } else {
+                                    return 'fmod('.$operand.', 1) == 0 && '.
+                                           $operand.' >= '.$endpoints[0].' && '.
+                                           $operand.' <= '.$endpoints[1];
+                                }
+                            }, explode(',', $ranges));
+
+                            $v = implode(' || ', $ranges);
+
+                            // Replace first occurrence of operand with expression.
+                            $v = preg_replace('/'.preg_quote($operand, '/').'/', $expression, $v, 1);
+
+                            $v = '('.$v.')';
+
+                            if ($operator == '!=') {
+                                $v = '!'.$v;
+                            }
+
+                            return $v;
+                        },
+                        $v);
+
+                    $v = preg_replace('/\$n % ([\d.]+)/', 'fmod($n, $1)', $v);
+
+                    $data[$l][$rule] = new PhpFunction($args, 'return ' . trim($v) . ';');
+                }
+            }
+        }
+
+        return $data;
     }
 }
 
